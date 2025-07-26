@@ -41,8 +41,11 @@ func (s *HandlerFactory) HandlerWrapper(standardHandlerFactory router.HandlerFac
 	return func(cfg *config.EndpointConfig, p proxy.Proxy) gin.HandlerFunc {
 		s.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Building the http handler", cfg.Endpoint))
 
-		// Check if this is an SSE endpoint
+		// Check if this is an SSE endpoint and enforce no-op encoding
 		if _, ok := cfg.ExtraConfig["sse"]; ok {
+			// Programmatically enforce no-op output encoding for SSE endpoints
+			s.enforceNoOpEncoding(cfg)
+
 			// Create middleware chain for auth/validation/metrics but with a noop endpoint
 			// This applies all middleware but doesn't actually process the request
 			validateHandler := standardHandlerFactory(cfg, func(ctx context.Context, _ *proxy.Request) (*proxy.Response, error) {
@@ -81,8 +84,98 @@ func (s *HandlerFactory) HandlerWrapper(standardHandlerFactory router.HandlerFac
 	}
 }
 
+// validateBackendConfig validates the backend configuration for SSE endpoints
+func (s *HandlerFactory) validateBackendConfig(cfg *config.EndpointConfig) (*config.Backend, error) {
+	if len(cfg.Backend) == 0 {
+		return nil, fmt.Errorf("no backend configured for SSE endpoint")
+	}
+
+	backendConfig := cfg.Backend[0]
+	if len(backendConfig.Host) == 0 {
+		return nil, fmt.Errorf("no host configured for SSE backend")
+	}
+
+	return backendConfig, nil
+}
+
+// enforceNoOpEncoding programmatically ensures no-op output encoding for SSE endpoints
+func (s *HandlerFactory) enforceNoOpEncoding(cfg *config.EndpointConfig) {
+	// Clear any existing output encoding configuration
+	if cfg.ExtraConfig == nil {
+		cfg.ExtraConfig = make(map[string]interface{})
+	}
+
+	// Set output encoding to no-op explicitly
+	cfg.OutputEncoding = "no-op"
+
+	// Also ensure backend output encoding is no-op
+	for i := range cfg.Backend {
+		cfg.Backend[i].Encoding = "no-op"
+	}
+
+	// Remove any conflicting encoding configurations from extra config
+	delete(cfg.ExtraConfig, "encoding")
+	delete(cfg.ExtraConfig, "output_encoding")
+
+	s.logger.Debug("Enforced no-op encoding for SSE endpoint")
+}
+
 // NewHandler creates a new SSE handler
-func (s *HandlerFactory) NewHandler(cfg *config.EndpointConfig, _ proxy.Proxy) gin.HandlerFunc {
+func (s *HandlerFactory) NewHandler(cfg *config.EndpointConfig, fallbackProxy proxy.Proxy) gin.HandlerFunc {
+	// Validate backend configuration at construction time
+	backendConfig, err := s.validateBackendConfig(cfg)
+	if err != nil {
+		s.logger.Error(fmt.Sprintf("SSE backend validation failed: %v", err))
+		// Return a handler that falls back to the standard proxy
+		return func(c *gin.Context) {
+			// Create a proxy request from the gin context
+			req := &proxy.Request{
+				Method:  c.Request.Method,
+				URL:     c.Request.URL,
+				Query:   c.Request.URL.Query(),
+				Path:    c.Request.URL.Path,
+				Body:    c.Request.Body,
+				Params:  make(map[string]string),
+				Headers: make(map[string][]string),
+			}
+
+			// Copy headers
+			for k, v := range c.Request.Header {
+				req.Headers[k] = v
+			}
+
+			// Copy path parameters if any
+			for _, param := range c.Params {
+				req.Params[param.Key] = param.Value
+			}
+
+			// Call the fallback proxy
+			resp, err := fallbackProxy(c.Request.Context(), req)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+
+			// Set response headers
+			for k, vs := range resp.Metadata.Headers {
+				for _, v := range vs {
+					c.Header(k, v)
+				}
+			}
+
+			// Set status code
+			c.Status(resp.Metadata.StatusCode)
+
+			// Write response body
+			if resp.Data != nil {
+				c.JSON(resp.Metadata.StatusCode, resp.Data)
+			}
+		}
+	}
+
+	s.logger.Debug(fmt.Sprintf("SSE endpoint configured with no-op encoding: %s", cfg.Endpoint))
+
+	// Backend config is valid, return the SSE handler
 	return func(c *gin.Context) {
 		// Set up the SSE connection
 		sseCfg := s.setupSSEConnection(c, cfg)
@@ -91,8 +184,8 @@ func (s *HandlerFactory) NewHandler(cfg *config.EndpointConfig, _ proxy.Proxy) g
 		_, keepAliveCancel := s.startKeepAlive(c, sseCfg)
 		defer keepAliveCancel()
 
-		// Validate backend configuration and proceed with request if valid
-		s.processBackendRequest(c, cfg)
+		// Process the backend request with the validated config
+		s.prepareAndExecuteRequest(c, *backendConfig)
 	}
 }
 
@@ -150,28 +243,6 @@ func (s *HandlerFactory) startKeepAlive(c *gin.Context, sseCfg Config) (context.
 	}()
 
 	return keepAliveCtx, keepAliveCancel
-}
-
-// processBackendRequest validates the backend configuration and processes the request
-func (s *HandlerFactory) processBackendRequest(c *gin.Context, cfg *config.EndpointConfig) {
-	// Validate backend configuration
-	if len(cfg.Backend) == 0 {
-		s.logger.Error("No backend configured for SSE endpoint")
-		c.Writer.WriteString("event: error\ndata: {\"message\":\"No backend configured\"}\n\n")
-		c.Writer.Flush()
-		return
-	}
-
-	backendConfig := cfg.Backend[0]
-	if len(backendConfig.Host) == 0 {
-		s.logger.Error("No host configured for SSE backend")
-		c.Writer.WriteString("event: error\ndata: {\"message\":\"No host configured\"}\n\n")
-		c.Writer.Flush()
-		return
-	}
-
-	// Continue with request processing
-	s.prepareAndExecuteRequest(c, *backendConfig)
 }
 
 // prepareAndExecuteRequest prepares and executes the backend request
