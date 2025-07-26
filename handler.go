@@ -95,6 +95,28 @@ func (s *HandlerFactory) validateBackendConfig(cfg *config.EndpointConfig) (*con
 	return backendConfig, nil
 }
 
+// enforceNoOpEncoding programmatically ensures no-op output encoding for SSE endpoints
+func (s *HandlerFactory) enforceNoOpEncoding(cfg *config.EndpointConfig) {
+	// Clear any existing output encoding configuration
+	if cfg.ExtraConfig == nil {
+		cfg.ExtraConfig = make(map[string]interface{})
+	}
+
+	// Set output encoding to no-op explicitly
+	cfg.OutputEncoding = "no-op"
+
+	// Also ensure backend output encoding is no-op
+	for i := range cfg.Backend {
+		cfg.Backend[i].Encoding = "no-op"
+	}
+
+	// Remove any conflicting encoding configurations from extra config
+	delete(cfg.ExtraConfig, "encoding")
+	delete(cfg.ExtraConfig, "output_encoding")
+
+	s.logger.Debug("Enforced no-op encoding for SSE endpoint")
+}
+
 // NewHandler creates a new SSE handler
 func (s *HandlerFactory) NewHandler(cfg *config.EndpointConfig, fallbackProxy proxy.Proxy) gin.HandlerFunc {
 	// Validate backend configuration at construction time
@@ -147,6 +169,11 @@ func (s *HandlerFactory) NewHandler(cfg *config.EndpointConfig, fallbackProxy pr
 			}
 		}
 	}
+
+	// Programmatically enforce no-op output encoding for SSE endpoints
+	s.enforceNoOpEncoding(cfg)
+
+	s.logger.Debug(fmt.Sprintf("SSE endpoint configured with no-op encoding: %s", cfg.Endpoint))
 
 	// Backend config is valid, return the SSE handler
 	return func(c *gin.Context) {
