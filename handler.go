@@ -41,8 +41,11 @@ func (s *HandlerFactory) HandlerWrapper(standardHandlerFactory router.HandlerFac
 	return func(cfg *config.EndpointConfig, p proxy.Proxy) gin.HandlerFunc {
 		s.logger.Debug(fmt.Sprintf("[ENDPOINT: %s] Building the http handler", cfg.Endpoint))
 
-		// Check if this is an SSE endpoint
+		// Check if this is an SSE endpoint and enforce no-op encoding
 		if _, ok := cfg.ExtraConfig["sse"]; ok {
+			// Programmatically enforce no-op output encoding for SSE endpoints
+			s.enforceNoOpEncoding(cfg)
+
 			// Create middleware chain for auth/validation/metrics but with a noop endpoint
 			// This applies all middleware but doesn't actually process the request
 			validateHandler := standardHandlerFactory(cfg, func(ctx context.Context, _ *proxy.Request) (*proxy.Response, error) {
@@ -169,9 +172,6 @@ func (s *HandlerFactory) NewHandler(cfg *config.EndpointConfig, fallbackProxy pr
 			}
 		}
 	}
-
-	// Programmatically enforce no-op output encoding for SSE endpoints
-	s.enforceNoOpEncoding(cfg)
 
 	s.logger.Debug(fmt.Sprintf("SSE endpoint configured with no-op encoding: %s", cfg.Endpoint))
 
