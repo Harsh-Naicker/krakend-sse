@@ -43,6 +43,13 @@ func (s *HandlerFactory) HandlerWrapper(standardHandlerFactory router.HandlerFac
 
 		// Check if this is an SSE endpoint
 		if _, ok := cfg.ExtraConfig["sse"]; ok {
+			// Validate backend configuration before creating the handler
+			if err := s.validateBackendConfig(cfg); err != nil {
+				s.logger.Error(fmt.Sprintf("SSE backend configuration error: %s", err.Error()))
+				// Fall back to the standard proxy handler
+				return standardHandlerFactory(cfg, p)
+			}
+
 			// Create middleware chain for auth/validation/metrics but with a noop endpoint
 			// This applies all middleware but doesn't actually process the request
 			validateHandler := standardHandlerFactory(cfg, func(ctx context.Context, _ *proxy.Request) (*proxy.Response, error) {
@@ -81,8 +88,38 @@ func (s *HandlerFactory) HandlerWrapper(standardHandlerFactory router.HandlerFac
 	}
 }
 
+// validateBackendConfig validates the backend configuration
+func (s *HandlerFactory) validateBackendConfig(cfg *config.EndpointConfig) error {
+	if len(cfg.Backend) == 0 {
+		return fmt.Errorf("no backend configured for SSE endpoint")
+	}
+
+	backendConfig := cfg.Backend[0]
+	if len(backendConfig.Host) == 0 {
+		return fmt.Errorf("no host configured for SSE backend")
+	}
+
+	return nil
+}
+
 // NewHandler creates a new SSE handler
-func (s *HandlerFactory) NewHandler(cfg *config.EndpointConfig, _ proxy.Proxy) gin.HandlerFunc {
+func (s *HandlerFactory) NewHandler(cfg *config.EndpointConfig, proxy proxy.Proxy) gin.HandlerFunc {
+	// Pre-check backend configuration to ensure it's valid
+	// We already validated in HandlerWrapper, but double-check here
+	if err := s.validateBackendConfig(cfg); err != nil {
+		s.logger.Error(fmt.Sprintf("SSE backend configuration error in NewHandler: %s", err.Error()))
+		// Return a handler that will send an error event
+		return func(c *gin.Context) {
+			// Set up the SSE connection
+			s.setupSSEConnection(c, cfg)
+			c.Writer.WriteString(fmt.Sprintf("event: error\ndata: {\"message\":\"%s\"}\n\n", err.Error()))
+			c.Writer.Flush()
+		}
+	}
+
+	// Get the backend configuration that we'll use for requests
+	backendConfig := cfg.Backend[0]
+
 	return func(c *gin.Context) {
 		// Set up the SSE connection
 		sseCfg := s.setupSSEConnection(c, cfg)
@@ -91,8 +128,29 @@ func (s *HandlerFactory) NewHandler(cfg *config.EndpointConfig, _ proxy.Proxy) g
 		_, keepAliveCancel := s.startKeepAlive(c, sseCfg)
 		defer keepAliveCancel()
 
-		// Validate backend configuration and proceed with request if valid
-		s.processBackendRequest(c, cfg)
+		// Prepare and execute the backend request directly here
+		// Get request body
+		rawBody, exists := c.Get("rawBody")
+		if !exists {
+			s.logger.Error("Request body not found in context")
+			c.Writer.WriteString("event: error\ndata: {\"message\":\"Request body not found\"}\n\n")
+			c.Writer.Flush()
+			return
+		}
+		bodyBytes := rawBody.([]byte)
+
+		// Construct the backend URL
+		backendURL := fmt.Sprintf("%s%s", backendConfig.Host[0], backendConfig.URLPattern)
+		s.logger.Debug(fmt.Sprintf("SSE backend URL: %s", backendURL))
+
+		// Create and send request
+		req, err := s.createRequest(c, *backendConfig, backendURL, bodyBytes)
+		if err != nil {
+			return
+		}
+
+		// Execute request and process response
+		s.executeRequestAndHandleResponse(c, req)
 	}
 }
 
@@ -150,62 +208,6 @@ func (s *HandlerFactory) startKeepAlive(c *gin.Context, sseCfg Config) (context.
 	}()
 
 	return keepAliveCtx, keepAliveCancel
-}
-
-// processBackendRequest validates the backend configuration and processes the request
-func (s *HandlerFactory) processBackendRequest(c *gin.Context, cfg *config.EndpointConfig) {
-	// Validate backend configuration
-	if len(cfg.Backend) == 0 {
-		s.logger.Error("No backend configured for SSE endpoint")
-		c.Writer.WriteString("event: error\ndata: {\"message\":\"No backend configured\"}\n\n")
-		c.Writer.Flush()
-		return
-	}
-
-	backendConfig := cfg.Backend[0]
-	if len(backendConfig.Host) == 0 {
-		s.logger.Error("No host configured for SSE backend")
-		c.Writer.WriteString("event: error\ndata: {\"message\":\"No host configured\"}\n\n")
-		c.Writer.Flush()
-		return
-	}
-
-	// Continue with request processing
-	s.prepareAndExecuteRequest(c, *backendConfig)
-}
-
-// prepareAndExecuteRequest prepares and executes the backend request
-func (s *HandlerFactory) prepareAndExecuteRequest(c *gin.Context, backendConfig config.Backend) {
-	// Construct the backend URL
-	backendURL := fmt.Sprintf("%s%s", backendConfig.Host[0], backendConfig.URLPattern)
-	s.logger.Debug(fmt.Sprintf("SSE backend URL: %s", backendURL))
-
-	// Get request body
-	bodyBytes, ok := s.getRequestBody(c)
-	if !ok {
-		return
-	}
-
-	// Create and send request
-	req, err := s.createRequest(c, backendConfig, backendURL, bodyBytes)
-	if err != nil {
-		return
-	}
-
-	// Execute request and process response
-	s.executeRequestAndHandleResponse(c, req)
-}
-
-// getRequestBody extracts the request body from the context
-func (s *HandlerFactory) getRequestBody(c *gin.Context) ([]byte, bool) {
-	rawBody, exists := c.Get("rawBody")
-	if !exists {
-		s.logger.Error("Request body not found in context")
-		c.Writer.WriteString("event: error\ndata: {\"message\":\"Request body not found\"}\n\n")
-		c.Writer.Flush()
-		return nil, false
-	}
-	return rawBody.([]byte), true
 }
 
 // createRequest creates a new HTTP request
